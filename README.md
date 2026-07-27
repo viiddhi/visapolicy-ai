@@ -1,8 +1,8 @@
 # Visapolicy.ai
 
-**Real-time, AI-powered USCIS/immigration policy alerts** — turns dense Federal Register legal text into plain-English "does this affect me?" digests, personalized to each user's visa status, green card stage, employer type, and dependents.
+**Real-time, AI-powered USCIS/immigration policy alerts** turns dense Federal Register legal text into plain-English "does this affect me?" digests, personalized to each user's visa status, green card stage, employer type, and dependents.
 
-Every day, USCIS, DHS, EOIR, CBP, and ICE publish rule changes that can directly affect an immigrant's legal status — a new site-visit requirement, a changed OPT rule, a shifted priority date. Almost none of it is written for a non-lawyer, and there's no single place that tells you *"this specific change affects you."* Visapolicy.ai automates that: it watches the Federal Register, uses an LLM to extract structured rule changes (not just a summary — the exact before/after text, impact level, and who's affected), and scores each change against a user's actual profile before ever surfacing it.
+Every day, USCIS, DHS, EOIR, CBP, and ICE publish rule changes that can directly affect an immigrant's legal status — a new site-visit requirement, a changed OPT rule, a shifted priority date. Almost none of it is written for a non-lawyer, and there's no single place that tells you *"this specific change affects you."* Visapolicy.ai automates that: it watches the Federal Register, uses an LLM to extract structured rule changes (not just a summary the exact before/after text, impact level, and who's affected), and scores each change against a user's actual profile before ever surfacing it.
 
 ## Architecture
 
