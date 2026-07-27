@@ -1,0 +1,227 @@
+VISAPOLICY.AI — COMPLETE TECH STACK
+=====================================
+(Compiled after a full Phase 1 review/debug session)
+
+
+1. LANGUAGE & RUNTIME: Python 3.12 + asyncio
+---------------------------------------------
+Everything in the backend is async (run.py, pipeline.py, ingestion, extraction
+all use async def/await). Why: the pipeline is I/O-bound, not CPU-bound — it
+spends its time waiting on Federal Register HTTP calls and Groq API calls, not
+computing. Async lets those waits overlap rather than blocking the whole
+process on each network round-trip. Note: not used for true concurrency yet —
+pipeline.py processes documents in a straight for-loop, awaiting each one
+sequentially. It's "async because the libraries are async," with room to add
+asyncio.gather() later for real parallelism.
+
+
+2. DATA LAYER: PostgreSQL + SQLAlchemy + Alembic
+---------------------------------------------------
+- PostgreSQL (docker-compose.yml, a single postgres:16 container) — chosen
+  over SQLite because this runs as a real service shared by the FastAPI app
+  and the pipeline, supports JSON columns (used heavily on
+  RuleChange.visa_categories_affected, tags, User.dependent_visa_types), and
+  scales past a single-writer file-based DB once real users exist.
+
+- SQLAlchemy 2.0 (src/db/models.py) — the ORM layer. Standard for Python,
+  works synchronously (simpler than async SQLAlchemy, since the async I/O
+  that matters is at the HTTP layer, not the DB layer). DeclarativeBase gives
+  real Python classes/relationships (PolicyDocument.changes,
+  RuleChange.document) instead of hand-written SQL.
+
+- Alembic (alembic/versions/001_initial_schema.py, 002_expand_user_profile.py)
+  — the migration tool paired with SQLAlchemy by the same maintainers. Why it
+  exists separately from Base.metadata.create_all(): create_all() (used in
+  init_db()) only ever ADDS new tables — it can't alter an existing column or
+  rename anything. Alembic's versioned migrations are what let 002 actually
+  expand the users table (add gc_stage, priority_date, etc.) on a database
+  that already has data in it, without dropping and recreating.
+
+- psycopg2-binary — the C driver SQLAlchemy talks to Postgres through;
+  -binary variant chosen so you don't need PostgreSQL's dev headers installed
+  locally to compile it.
+
+
+3. CONFIG: pydantic-settings + python-dotenv
+-----------------------------------------------
+src/config.py defines a typed Settings class that reads .env once at import
+time. Why not just os.getenv() scattered everywhere: one source of truth,
+type validation (e.g. lookback_days: int — a malformed .env value fails fast
+at startup instead of causing a mysterious bug three functions later), and
+autocomplete/type-checking in the editor (settings.groq_api_key vs. a
+stringly-typed os.environ["GROQ_API_KEY"]).
+
+
+4. INGESTION: httpx (async) + BeautifulSoup + html2text + tenacity
+-----------------------------------------------------------------------
+- httpx instead of requests — specifically because it supports async/await
+  natively (requests is sync-only), matching the rest of the pipeline.
+
+- BeautifulSoup — strips <nav>, <header>, <footer>, scripts/styles from the
+  raw Federal Register HTML before it reaches the LLM
+  (federal_register.py:103). Every irrelevant token sent is wasted money and
+  TPM budget, and noisy boilerplate measurably hurts extraction quality on
+  dense legal text.
+
+- html2text — converts cleaned HTML into markdown-like plain text. LLMs
+  generally parse clean markdown more reliably than raw HTML tag soup, and
+  it's far more token-efficient than sending markup.
+
+- tenacity (@retry(stop=stop_after_attempt(3), wait=wait_exponential(...)))
+  — wraps both Federal Register calls and Groq calls. Chosen over hand-rolled
+  retry loops because exponential backoff with jitter is fiddly to get right;
+  this is a declarative one-line decorator for it. IMPORTANT CAVEAT (found
+  live during testing): retry only helps for genuinely transient failures —
+  a 413 "too large" error isn't transient, which is exactly the bug we hit
+  and fixed via chunking instead of relying on retry.
+
+
+5. AI / LLM: Groq running llama-3.3-70b-versatile, via function-calling
+----------------------------------------------------------------------------
+The most deliberate tradeoff in the stack. Claude was the original choice,
+then switched to Groq/Llama. Reasoning: Claude needs a paid key; Groq's free
+tier runs a 70B model at no cost; the dev machine (M1 Air, 8GB RAM) can't run
+anything that large locally via Ollama (~4GB usable after OS overhead limits
+you to weak 7B models that struggle with structured JSON extraction from
+80k-character legal text); and since Federal Register documents are public
+record, sending them to a third-party cloud API carries no privacy downside.
+
+WHAT WE LEARNED FIRSTHAND RUNNING IT LIVE: this tradeoff is real but has a
+sharp edge Groq's free tier doesn't advertise loudly — the constraint isn't
+really "14,400 requests/day" (generous), it's 12,000 TOKENS/MINUTE, and a
+single long legal document can exceed that in ONE request by itself. That's
+precisely the bug fixed with chunking (see "Bugs found" section below). It's
+a legitimate cost/quality tradeoff (cheap + capable model, at the price of
+needing extra engineering to respect a stingy per-request rate limit), not a
+free lunch.
+
+Function-calling / tool-use (EXTRACTION_TOOL in extractor.py) rather than
+asking for prose: forces the model into a strict JSON schema (old_rule,
+new_rule, impact_level, etc.) that the rest of the pipeline can parse and
+store directly, instead of trying to regex a summary paragraph out of prose.
+
+
+6. EMAIL DELIVERY: Resend
+-----------------------------
+Chosen for transactional email over e.g. SMTP/SendGrid/SES, likely for its
+clean modern API and generous free tier for a project this size. Requires a
+VERIFIED SENDING DOMAIN — the thing we worked through together, discovering
+visapolicy.ai isn't actually registered anywhere, and routing around it with
+Resend's onboarding@resend.dev sandbox sender for testing.
+
+src/alerts/email.py builds a hand-rolled inline-styled HTML template (no
+templating library) — deliberate, since email clients (Gmail, Outlook) strip
+<style> blocks and external CSS, so inline style= attributes are the only
+reliable way to get consistent rendering across inboxes.
+
+
+7. API LAYER (Phase 2): FastAPI + Uvicorn + JWT (python-jose) + Passlib/bcrypt + SSE
+-----------------------------------------------------------------------------------------
+- FastAPI — automatic request/response validation via Pydantic schemas
+  (src/api/schemas/), auto-generated OpenAPI docs, native async support
+  matching the rest of the codebase.
+
+- Uvicorn (uvicorn[standard]) — the ASGI server FastAPI actually runs on.
+
+- JWT via python-jose (src/api/dependencies.py) — stateless auth: the token
+  itself carries the user id (sub claim) and expiry, so the server doesn't
+  need a session store. OAuth2PasswordBearer is FastAPI's standard "expect a
+  Bearer token" dependency, paired with /auth/login as the token URL.
+
+- Passlib + bcrypt (auth.py:11) — hashes passwords before they touch the DB;
+  bcrypt is the standard slow-hash algorithm chosen specifically to resist
+  brute-forcing if the DB ever leaks.
+
+- sse-starlette — powers GET /stream/alerts, a Server-Sent-Events endpoint
+  for pushing real-time alerts to the dashboard without the client needing to
+  poll.
+
+SECURITY FLAG (worth fixing before this goes further): dependencies.py:12 has
+    SECRET_KEY = "change-this-in-production-use-env-var"
+hardcoded directly in source rather than pulled from .env/Settings. Fine for
+local dev, but a real problem the moment this deploys anywhere shared —
+anyone with the source can forge valid login tokens for any user. Move it
+into config.py/.env before hardening Phase 2 further.
+
+
+8. FRONTEND: Next.js 15 + React 19 + TypeScript + Tailwind CSS
+-------------------------------------------------------------------
+- Next.js (App Router) — chosen over plain React/Vite for file-based routing
+  (app/page.tsx, app/onboarding/page.tsx, app/dashboard/page.tsx map directly
+  to URLs) and because it's the standard default for a React project needing
+  SSR/routing without much extra config.
+
+- TypeScript — type safety across the API boundary; lib/api.ts is a typed
+  fetch wrapper so component code gets compile-time checking against the
+  shape of API responses instead of dealing with `any`.
+
+- Tailwind CSS — utility-class styling, chosen for speed of building UI
+  without hand-writing a separate CSS file per component.
+
+- lib/auth.ts — stores the JWT in localStorage and attaches it as a Bearer
+  header on requests. TRADEOFF TO KNOW: localStorage tokens are readable by
+  any JS on the page, a real XSS exposure surface compared to an httpOnly
+  cookie — reasonable for velocity at this stage, worth reconsidering before
+  handling real user data at scale.
+
+
+9. LOCAL DEV INFRA: Docker Compose
+--------------------------------------
+docker-compose.yml runs just the one Postgres container — the app and
+pipeline run natively on your machine (not containerized); Postgres is the
+one piece that's genuinely painful to install/manage bare-metal, so it's the
+one thing containerized for convenience.
+
+
+THE THROUGHLINE
+==================
+Almost every choice in this stack favors "free tier + minimal ops overhead"
+over "most robust default": Groq over Claude, sandbox email over a real
+verified domain, hardcoded dev secret over env-managed secret, JWT-in-
+localStorage over httpOnly cookies. Coherent and reasonable for a solo
+project still proving out the idea — but worth being deliberate about which
+of these you carry into anything resembling production. Several of the
+"temporary for now" choices (the secret key, the sandbox sender, the domain)
+are exactly the ones that turned into real blockers during this session's
+live test run.
+
+
+APPENDIX: BUGS FOUND & FIXED DURING THIS SESSION'S LIVE VERIFICATION
+=========================================================================
+1. Null-abstract crash (src/ingestion/federal_register.py, _is_immigration_relevant)
+   - item.get("abstract", "") only supplies the default when the key is
+     MISSING, not when it's present but null. A real Federal Register doc
+     with abstract: null crashed with TypeError: can only concatenate str
+     (not "NoneType") to str.
+   - Fix: item.get("abstract") or "" (same for title).
+
+2. Groq TPM (tokens-per-minute) limit crash on long documents
+   (src/processing/extractor.py)
+   - Groq's free tier caps requests at 12,000 tokens/minute per request. The
+     80,000-char truncation cap (sized for Claude's context window, not
+     Groq's rate limit) let one real document (EB-5 Reform rule) request
+     25,178 tokens in a single call — over double the limit, in one shot.
+     Retries didn't help since the same oversized payload fails identically
+     every time.
+   - Fix: added chunking — documents over ~20,000 chars are split on
+     paragraph boundaries into multiple sub-requests, each extracted
+     separately, then merged (changes concatenated, impact level = max
+     across chunks, categories/tags deduplicated).
+
+3. Invalid / then-unverified Resend sending setup
+   - RESEND_API_KEY in .env was invalid (rejected by Resend) — user rotated
+     it.
+   - RESEND_FROM_EMAIL (alerts@visapolicy.ai) failed because the domain
+     isn't verified in Resend — and further investigation (whois + NS
+     lookup) showed visapolicy.ai isn't registered with any domain registrar
+     at all.
+   - Temporary fix: switched RESEND_FROM_EMAIL to Resend's sandbox sender
+     (onboarding@resend.dev) to unblock testing. MUST be switched back to a
+     real, verified domain before production use.
+
+Live verification result after fixes: 7 documents fetched from Federal
+Register (last 30 days), 5 new after dedup, 24 rule changes extracted
+(including 23 from the one large chunked document), matching engine
+correctly filtered 23/26 stored changes to an EB-5 test profile, and a real
+test digest email was successfully sent via Resend's sandbox sender to
+viiddhi.09@gmail.com.
